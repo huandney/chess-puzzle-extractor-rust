@@ -1,0 +1,39 @@
+[package]
+name = "chess_puzzles_rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Chess libraries
+pgn-reader = "0.26.0"
+ruci        = { version = "1.0.1", features = ["engine-async"] }
+shakmaty    = "0.27.3"
+shakmaty-syzygy = "0.25.3"
+
+# CLI & utilities
+anyhow       = "1.0.98"
+clap         = { version = "4.5.37", features = ["derive"] }
+indexmap     = "2.9.0"
+lazy_static = "1.5.0"
+serde        = { version = "1.0.219", features = ["derive"] }
+serde_json   = "1.0.140"
+
+# TUI & terminal
+colored    = "3.0.0"
+indicatif  = "0.17.11"
+
+# Async & concurrency
+futures-util = "0.3"
+tokio        = { version = "1.44.2", features = [
+    "macros",         # #[tokio::main], #[tokio::test]
+    "process",        # tokio::process::Command
+    "sync",           # tokio::sync::Mutex
+    "time",           # tokio::time::timeout, Duration
+    "rt-multi-thread",# multi-threaded runtime
+    "io-util"         # AsyncBufReadExt, AsyncWriteExt, BufReader
+] }
+
+# Logging
+log = "0.4"
+env_logger = { version = "0.11.8", features = ["auto-color"] }
+chrono = "0.4.40"
