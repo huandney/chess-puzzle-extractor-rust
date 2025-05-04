@@ -6,7 +6,7 @@
 // ---------------------------------------------------------------------------
 
 use anyhow::{anyhow, Result};
-use shakmaty::{Chess, Color, Move, Position};        // Position → legal_moves / play_unchecked
+use shakmaty::{Chess, Color, Move, Position};
 
 use crate::{config, engine::Engine, utils::DepthSet, visual::CustomProgressBar};
 
