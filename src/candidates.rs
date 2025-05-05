@@ -1,21 +1,20 @@
 // src/candidates.rs
 // ---------------------------------------------------------------------------
-// Blunder‑scan minimalista: 1 avaliação por posição e apenas o filtro
-// “solver tem pelo menos 2 jogadas”.  Todo o pipeline é realizado em
-// CandidateContext::find_candidate, que devolve Option<PuzzleCandidate>.
+// Varredura de blunders: 1 chamada ao engine por lance. Fila de candidatos.
 // ---------------------------------------------------------------------------
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use shakmaty::{Chess, Color, Move, Position};
+use crate::{
+    config,
+    engine::Engine,
+    utils::{DepthSet, MoveRecord},
+    visual::CustomProgressBar,
+};
 
-use crate::{config, engine::Engine, utils::DepthSet, visual::CustomProgressBar};
-
-// ---------------------------------------------------------------------------
-// Estruturas públicas
-// ---------------------------------------------------------------------------
 pub struct CandidateContext<'a> {
-    pub engine:       &'a mut Engine,
-    pub progress_bar: Option<&'a CustomProgressBar>,
+    engine:       &'a mut Engine,
+    progress_bar: Option<&'a CustomProgressBar>,
 }
 
 #[derive(Debug, Clone)]
@@ -29,51 +28,83 @@ pub struct PuzzleCandidate {
     pub move_number       : u32,
 }
 
-// ---------------------------------------------------------------------------
-// Pipeline completo – única análise por posição
-// ---------------------------------------------------------------------------
 impl<'a> CandidateContext<'a> {
-    /// Analisa board + mv. Requer prev_cp já disponível para economizar
-    /// CPU.  Retorna Ok(Some(candidate)) se passar em todos filtros leves.
-    pub async fn find_candidate(
+    #[inline]
+    pub fn new(
+        engine:       &'a mut Engine,
+        progress_bar: Option<&'a CustomProgressBar>,
+    ) -> Self {
+        Self { engine, progress_bar }
+    }
+
+    pub async fn collect_candidates<I>(
         &mut self,
-        board_pre : &Chess,
-        mv        : &Move,
-        prev_cp   : i32,
-        depth_set : &DepthSet,
-        move_no   : u32,
-    ) -> Result<Option<PuzzleCandidate>> {
-        // posição pós‑blunder
-        let mut board_post = board_pre.clone();
-        board_post.play_unchecked(mv);
+        mut board: Chess,
+        games: I,
+        depths: &DepthSet,
+    ) -> Result<Vec<(PuzzleCandidate, Vec<(String, String)>)>>
+    where
+        I: IntoIterator<Item = MoveRecord>,
+    {
+        let init = self.engine.analyze(&board, depths.scan, 1).await?[0]
+            .score.as_ref().unwrap().clone();
+        let mut prev_cp = Engine::to_cp(&init);
+        let mut pool = Vec::new();
 
-        // avaliação pós (única consulta ao motor)
-        let post_std = self.engine.analyze(&board_post, depth_set.scan, 1).await?
-            .get(0).and_then(|i| i.score.clone())
-            .ok_or_else(|| anyhow!("análise pós‑blunder ausente"))?;
-
-        // converte para centipawns o post-blunder
-        let post_cp = Engine::to_cp(&post_std);
-        // diferença absoluta em centipawns
-        let diff = (post_cp - prev_cp).abs() as i64;
-        // fail-fast: descarta quedas menores que o limiar
-        if diff < config::BLUNDER_THRESHOLD as i64 {
-            return Ok(None);
+        for rec in games {
+            let (next_cp, maybe_cand) = self
+                .find_candidate(&board, &rec.mv, prev_cp, depths, rec.move_idx)
+                .await?;
+            if let Some(cand) = maybe_cand {
+                pool.push((cand, rec.headers));
+            }
+            board.play_unchecked(&rec.mv);
+            prev_cp = next_cp;
         }
-        // decide quem será o solver
+
+        Ok(pool)
+    }
+
+    async fn find_candidate(
+        &mut self,
+        board_pre: &Chess,
+        mv:        &Move,
+        prev_cp:   i32,
+        depths:    &DepthSet,
+        move_no:   u32,
+    ) -> Result<(i32, Option<PuzzleCandidate>)> {
+        let mut post = board_pre.clone();
+        post.play_unchecked(mv);
+
+        // falha rápido: sem jogadas → posição terminal
+        if post.legal_moves().len() < 1 {
+            return Ok((prev_cp, None));
+        }
+
+        let std = self.engine.analyze(&post, depths.scan, 1).await?[0]
+            .score.as_ref().unwrap().clone();
+        let post_cp = Engine::to_cp(&std);
+        let diff = (post_cp - prev_cp).abs() as i64;
+        if diff < config::BLUNDER_THRESHOLD as i64 {
+            return Ok((post_cp, None));
+        }
+
         let solver = if post_cp > prev_cp { Color::White } else { Color::Black };
+        if post.legal_moves().len() <= 1 {
+            return Ok((post_cp, None));
+        }
 
-        // filtro trivialidade: solver deve ter ≥2 escolhas
-        if board_post.legal_moves().len() <= 1 { return Ok(None); }
-
-        Ok(Some(PuzzleCandidate {
-            board_pre_blunder : board_pre.clone(),
-            board_post_blunder: board_post,
-            blunder_move      : mv.clone(),
-            solver_color      : solver,
-            pre_cp            : prev_cp,
-            post_cp           : post_cp,
-            move_number       : move_no,
-        }))
+        Ok((
+            post_cp,
+            Some(PuzzleCandidate {
+                board_pre_blunder : board_pre.clone(),
+                board_post_blunder: post,
+                blunder_move      : mv.clone(),
+                solver_color      : solver,
+                pre_cp            : prev_cp,
+                post_cp,
+                move_number       : move_no,
+            }),
+        ))
     }
 }
