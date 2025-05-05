@@ -209,47 +209,57 @@ pub fn prepare_output_file(input:&PathBuf, out:Option<&PathBuf>, resume:bool)->R
 // Build PGN - constrói representação PGN final do puzzle
 // ---------------------------------------------------------------------------
 /// Constrói string PGN a partir de headers e sequência de lances
-pub fn build_pgn_san<K,V>(hdr:&IndexMap<K,V>, seq:&PuzzleSeq)->Result<String>
-where K:AsRef<str>, V:AsRef<str>{
-    // Cabeçalhos PGN
-    let mut pgn=String::new();
-    for (k,v) in hdr { pgn.push_str(&format!("[{} \"{}\"]\n",k.as_ref(),v.as_ref())); }
+/// suportando headers originais + extras.
+/// * `hdr` deve conter todos os cabeçalhos já consolidados.
+pub fn build_pgn_san<K, V>(hdr: &IndexMap<K, V>, seq: &PuzzleSeq) -> Result<String>
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    use shakmaty::{san::San, fen::Fen, CastlingMode, Color};
+
+    // cabeçalhos
+    let mut pgn = String::new();
+    for (k, v) in hdr { pgn.push_str(&format!("[{} \"{}\"]\n", k.as_ref(), v.as_ref())); }
     pgn.push('\n');
 
-    // Inicializa tabuleiro a partir do FEN, se disponível
-    let mut board = if let Some(fen)=hdr.iter().find_map(|(k,v)|
-            k.as_ref().eq_ignore_ascii_case("fen").then(||v.as_ref())){
+    // tabuleiro inicial
+    let mut board = if let Some(fen) =
+        hdr.iter()
+           .find_map(|(k, v)| k.as_ref().eq_ignore_ascii_case("fen").then(|| v.as_ref()))
+    {
         fen.parse::<Fen>()?.into_position(CastlingMode::Standard)?
-    }else{Chess::default()};
+    } else {
+        Chess::default()
+    };
 
-    // Linha principal de lances
-    let init=board.turn();
-    for (i,mv) in seq.moves.iter().enumerate(){
-        // Numeração correta baseada no turno inicial
-        if i==0{
-            pgn.push_str(&format!("1{} ", if init==Color::White{'.'}else{'…'}));
-        }else if (init==Color::White && i%2==0)||(init==Color::Black && i%2==1){
-            pgn.push_str(&format!("{}. ", i/2+1));
+    // numeração SAN   (1… Rxg3 2. hxg3)
+    let mut turn = board.turn();
+    let mut ply  = 0usize;
+    for mv in &seq.moves {
+        if turn == Color::White {
+            pgn.push_str(&format!("{}.", ply / 2 + 1));
+        } else if ply == 0 {
+            pgn.push_str(&format!("{}... ", ply / 2 + 1));
         }
-
-        // Adiciona o lance em SAN
-        pgn.push_str(&format!("{} ", San::from_move(&board,mv)));
+        pgn.push_str(&format!("{} ", San::from_move(&board, mv)));
         board.play_unchecked(mv);
+        turn = board.turn();
+        ply += 1;
     }
 
-    // Variantes alternativas
-    let main=board.clone();
-    for var in &seq.alternatives{
+    // variantes (se houver)
+    let main_end = board.clone();
+    for var in &seq.alternatives {
         pgn.push('(');
-        let mut b=main.clone();
-        for mv in var{
-            pgn.push_str(&format!("{} ", San::from_move(&b,mv)));
+        let mut b = main_end.clone();
+        for mv in var {
+            pgn.push_str(&format!("{} ", San::from_move(&b, mv)));
             b.play_unchecked(mv);
         }
-        if pgn.ends_with(' '){pgn.pop();}
-        pgn.push_str(") ");
+        if pgn.ends_with(' ') { pgn.pop(); }
+        pgn.push(')');
+        pgn.push(' ');
     }
-
-    // Retorna PGN formatado
     Ok(pgn.trim_end().into())
 }
