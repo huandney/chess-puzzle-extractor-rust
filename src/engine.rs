@@ -1,271 +1,287 @@
-// src/engine.rs
-// ---------------------------------------------------------------------------
-//  • Syzygy DTZ (≤7 peças) com escolha adaptativa (win → menor DTZ, loss → maior)
-//  • env::split_paths para SYZYGY_PATHS (funciona em Windows/Unix)
-//  • AnalysisOrigin enum em AnalysisInfo
-//  • Helpers key / key_diff / is_mate / to_cp
-// ---------------------------------------------------------------------------
-
-use std::{
-    borrow::Cow,
-    collections::HashMap,
-    env,
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
-};
-
-use anyhow::{anyhow, Context, Result};
-use futures_util::future::ready;
-use log::trace;
-use shakmaty::{
-    fen::Fen, CastlingMode, Chess, Color, EnPassantMode, Move as ShakMove, Position, uci::UciMove,
-};
 use tokio::{
-    io::BufReader,
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
-    time::timeout,
+    sync::Mutex,
+    time::{timeout, Duration},
 };
-use ruci::{
-    engine::{Info, NormalBestMove, Score as RuciScore, ScoreStandardized},
-    gui::{traits::Message as UciMessage, Go, IsReady, Position as UciPosition, Quit, SetOption},
-    Engine as RuciEngine,
-};
-use shakmaty_syzygy::{Tablebase, Wdl, MaybeRounded, Dtz};
+use shakmaty::{Chess, Move as ShakMove, Position, uci::UciMove, fen::Fen, CastlingMode};
+use shakmaty_syzygy::{Tablebase, AmbiguousWdl};
+use std::{sync::Arc, cmp::Ordering, collections::HashMap};
+use anyhow::{Result, anyhow};
+use crate::config::{THREADS, HASH_MB};
 
-use crate::{config, utils::DepthSet};
+const ENGINE_TIMEOUT: Duration = Duration::from_secs(10);
 
-// ---------------------------------------------------------------------------
-// Constantes
-// ---------------------------------------------------------------------------
-const DEFAULT_TIMEOUT_MS: u64 = 10_000;
-const ANALYSIS_FACTOR:    u64 = 2;
-const MATE_KEY_OFFSET:    i64 = 2_000_000;
+/// Score retornado pelo engine ou tablebase
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Score { Cp(i32), Mate(i32) }
 
-// ---------------------------------------------------------------------------
-// Tipos públicos
-// ---------------------------------------------------------------------------
-#[derive(Debug, Clone, Copy)]
-pub enum AnalysisOrigin { Engine, Syzygy }
+impl Ord for Score {
+    fn cmp(&self, other: &Self) -> Ordering {
+        use Score::*;
+        match (self, other) {
+            (Mate(a), Mate(b)) => b.cmp(a),
+            (Mate(_), Cp(_))   => Ordering::Greater,
+            (Cp(_), Mate(_))   => Ordering::Less,
+            (Cp(a), Cp(b))     => a.cmp(b),
+        }
+    }
+}
 
-#[derive(Clone, Debug)]
+impl PartialOrd for Score {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Origem da análise
+#[derive(Debug, Clone)]
+enum AnalysisOrigin { Engine, Syzygy }
+
+/// Informações de cada linha de análise
+#[derive(Debug, Clone)]
 pub struct AnalysisInfo {
-    pub score:    Option<ScoreStandardized>,
-    pub depth:    Option<u8>,
-    pub seldepth: Option<u8>,
-    pub nodes:    Option<u64>,
-    pub pv:       Vec<ShakMove>,
-    pub origin:   AnalysisOrigin,
+    pub score: Score,  // Adicione 'pub' aqui
+    pub depth: u8,
+    pub pv: Vec<ShakMove>,
+    pub origin: AnalysisOrigin,
+    pub multipv: usize,
 }
 
+/// Engine UCI + tablebase incremental
 pub struct Engine {
-    inner:       RuciEngine<BufReader<ChildStdout>, ChildStdin>,
-    child:       Child,
-    timeout_ms:  u64,
-    current_mpv: u32,
-    tb:          Option<Tablebase<Chess>>,
-    start:       Instant,
+    child:           Child,
+    stdin:           Arc<Mutex<ChildStdin>>,
+    stdout:          Arc<Mutex<BufReader<ChildStdout>>>,
+    syzygy:          Option<Tablebase<Chess>>,
+    board:           Chess,
+    moves:           Vec<String>,
+    castling_mode:   CastlingMode,
+    position_cmd:    String,
+    position_synced: bool,
+    current_multipv: usize,
 }
 
-// ---------------------------------------------------------------------------
-// Implementação
-// ---------------------------------------------------------------------------
+impl Drop for Engine { fn drop(&mut self) { let _ = self.child.kill(); }}
+
 impl Engine {
-    // ---------- criação ----------
-    pub async fn new(path: &str) -> Result<Self> {
+    /// Espera por resposta "uciok" após comando "uci" per UCI spec: engine deve enviar "uciok" após options
+    async fn wait_uci(&self) -> Result<()> {
+        let mut buf = String::new();
+        loop {
+            let line = {
+                let mut r = self.stdout.lock().await;
+                r.read_line(&mut buf).await?;
+                buf.clone()
+            };
+            buf.clear();
+            if line.trim() == "uciok" { break; }
+        }
+        Ok(())
+    }
+
+    /// Envia "isready" e espera por "readyok"; essencial após setoption e ucinewgame
+    #[inline]
+    async fn wait_ready(&self) -> Result<()> {
+        self.cmd("isready").await?;
+        let mut buf = String::new();
+        loop {
+            let line = {
+                let mut r = self.stdout.lock().await;
+                r.read_line(&mut buf).await?;
+                buf.clone()
+            };
+            buf.clear();
+            if line.trim() == "readyok" { break; }
+        }
+        Ok(())
+    }
+    /// Cria engine com tablebase opcional
+    pub async fn new_with_syzygy(path: &str, tb_dirs: &[&str]) -> Result<Self> {
         let mut child = Command::new(path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .with_context(|| format!("Falha ao executar '{path}'"))?;
-
-        let stdout = child.stdout.take().ok_or_else(|| anyhow!("stdout indisponível"))?;
-        let stdin  = child.stdin .take().ok_or_else(|| anyhow!("stdin indisponível"))?;
-
-        let mut inner = RuciEngine { engine: BufReader::new(stdout), gui: stdin, strict: false };
-        timeout(Duration::from_millis(DEFAULT_TIMEOUT_MS), inner.use_uci_async(|_| ready(()))).await??;
-
-        for (k, v) in &[("Threads", config::THREADS), ("Hash", config::HASH_MB)] {
-            inner.send_async(SetOption { name: Cow::Borrowed(k), value: Some(Cow::Owned(v.to_string())) }).await?;
-        }
-        inner.send_async(IsReady).await?;
-        timeout(Duration::from_millis(DEFAULT_TIMEOUT_MS), inner.is_ready_async()).await??;
-
-        Ok(Self {
-            inner,
+            .spawn()?;
+        let stdin = Arc::new(Mutex::new(child.stdin.take().unwrap()));
+        let stdout = Arc::new(Mutex::new(BufReader::new(child.stdout.take().unwrap())));
+        let mut tb = Tablebase::<Chess>::new();
+        for d in tb_dirs { tb.add_directory(d)?; }
+        let engine = Engine {
             child,
-            timeout_ms: DEFAULT_TIMEOUT_MS,
-            current_mpv: 1,
-            tb: load_syzygy(),
-            start: Instant::now(),
-        })
+            stdin,
+            stdout,
+            syzygy: Some(tb),
+            board: Chess::default(),
+            moves: Vec::new(),
+            castling_mode: CastlingMode::Standard,
+            position_cmd: "position startpos".into(),
+            position_synced: false,
+            current_multipv: 0,
+        };
+        engine.cmd("uci").await?;
+        engine.wait_ready().await?;
+        engine.cmd(&format!("setoption name Threads value {}", THREADS)).await?;
+        engine.cmd(&format!("setoption name Hash value {}", HASH_MB)).await?;
+        engine.wait_ready().await?;
+        Ok(engine)
     }
 
-    // ---------- helpers públicos ----------
-    #[inline] pub fn key(s: &ScoreStandardized) -> i64 {
-        match s.score() {
-            RuciScore::Centipawns(cp)      => cp as i64,
-            RuciScore::MateIn(m) if m >= 0 => MATE_KEY_OFFSET - m as i64,
-            RuciScore::MateIn(m)           => -MATE_KEY_OFFSET - m as i64,
+    /// Cria engine sem tablebase
+    pub async fn new(path: &str) -> Result<Self> {
+        Self::new_with_syzygy(path, &[]).await
+    }
+
+    /// Reinicia jogo interno (limpa moves), espera readyok
+    pub async fn new_game(&mut self) -> Result<()> {
+        self.board = Chess::default();
+        self.moves.clear();
+        self.castling_mode = CastlingMode::Standard;
+        self.position_cmd = "position startpos".into();
+        self.position_synced = false;
+        self.current_multipv = 0;
+        self.cmd("ucinewgame").await?;
+        self.wait_ready().await?;
+        Ok(())
+    }
+
+    /// Garante que position_cmd foi enviado
+    #[inline]
+    async fn ensure_synced(&mut self) -> Result<()> {
+        if !self.position_synced {
+            self.cmd(&self.position_cmd).await?;
+            self.position_synced = true;
         }
+        Ok(())
     }
-    #[inline] pub fn key_diff(a: &ScoreStandardized, b: &ScoreStandardized) -> i64 { (Self::key(a) - Self::key(b)).abs() }
-    #[inline] pub fn is_mate(s: &ScoreStandardized) -> bool { matches!(s.score(), RuciScore::MateIn(_)) }
-    #[inline] pub fn to_cp(std: &ScoreStandardized) -> i32 {
-        match std.score() {
-            RuciScore::Centipawns(cp)      => cp as i32,
-            RuciScore::MateIn(p) if p >= 0 => 100_000 - p as i32,
-            RuciScore::MateIn(p)           => -100_000 - p as i32,
+
+    /// Aplica lance e marca desincronizado
+    pub async fn push_move(&mut self, mv: &ShakMove) -> Result<()> {
+        Position::play_unchecked(&mut self.board, mv);
+        let uci = UciMove::from_move(mv, self.castling_mode).to_string();
+        if self.moves.is_empty() {
+            self.position_cmd.push_str(" moves ");
+            self.position_cmd.push_str(&uci);
+        } else {
+            self.position_cmd.push(' ');
+            self.position_cmd.push_str(&uci);
         }
-    }
-
-    // ---------- internos ----------
-    async fn send<C>(&mut self, cmd: C) -> Result<()>
-    where C: UciMessage + std::fmt::Debug + Send + 'static
-    {
-        trace!("› {:?}", cmd);
-        timeout(Duration::from_millis(self.timeout_ms), self.inner.send_async(cmd)).await??;
+        self.moves.push(uci);
+        self.position_synced = false;
         Ok(())
     }
 
-    async fn ready(&mut self) -> Result<()> {
-        self.send(IsReady).await?;
-        timeout(Duration::from_millis(self.timeout_ms), self.inner.is_ready_async()).await??;
+    /// Analisa FEN sem alterar estado interno
+    pub async fn analyze_fen(&mut self, fen: &str, depth: u8, multipv: usize) -> Result<Vec<AnalysisInfo>> {
+        let old_board = self.board.clone();
+        let old_moves = self.moves.clone();
+        let old_cmd = self.position_cmd.clone();
+        let old_sync = self.position_synced;
+        let old_mpv = self.current_multipv;
+        let fen_struct: Fen = fen.parse()?;
+        self.board = fen_struct.into_position(self.castling_mode)?;
+        self.moves.clear();
+        self.position_cmd = format!("position fen {}", fen);
+        self.position_synced = false;
+        self.current_multipv = 0;
+        let res = self.analyze(depth, multipv).await;
+        self.board = old_board;
+        self.moves = old_moves;
+        self.position_cmd = old_cmd;
+        self.position_synced = old_sync;
+        self.current_multipv = old_mpv;
+        res
+    }
+
+    /// Envia comando UCI
+    #[inline]
+    async fn cmd(&self, c: &str) -> Result<()> {
+        let mut w = self.stdin.lock().await;
+        w.write_all(c.as_bytes()).await?;
+        w.write_all(b"\n").await?;
+        w.flush().await?;
         Ok(())
     }
 
-    async fn set_position(&mut self, board: &Chess) -> Result<()> {
-        let fen = Fen::from_position(board.clone(), EnPassantMode::Legal);
-        self.send(UciPosition::Fen { fen: Cow::Owned(fen), moves: Cow::Owned(Vec::new()) }).await?;
-        self.ready().await
-    }
-
-    async fn ensure_mpv(&mut self, mpv: u32) -> Result<()> {
-        if mpv == self.current_mpv { return Ok(()); }
-        self.send(SetOption { name: Cow::Borrowed("MultiPV"), value: Some(Cow::Owned(mpv.to_string())) }).await?;
-        self.ready().await?;
-        self.current_mpv = mpv;
-        Ok(())
-    }
-
-    // ---------- análise ----------
-    pub async fn analyze(&mut self, board: &Chess, depth: u8, mpv: u32) -> Result<Vec<AnalysisInfo>> {
-        if let Some(ref tb) = self.tb {
-            if board.board().occupied().into_iter().count() <= 7 {
-                return Ok(vec![probe_tablebase(board, tb)?]);
+    /// Analisa posição interna (streaming parse + agrupamento por PV)
+    pub async fn analyze(&mut self, depth: u8, multipv: usize) -> Result<Vec<AnalysisInfo>> {
+        if let Some(tb) = &self.syzygy {
+            let cnt = self.board.board().occupied().into_iter().count();
+            if cnt <= 7 {
+                let wdl = tb.probe_wdl(&self.board)?;
+                let sc = match wdl {
+                    AmbiguousWdl::Win  => Score::Mate(1),
+                    AmbiguousWdl::Loss => Score::Mate(-1),
+                    _                  => Score::Cp(0),
+                };
+                return Ok(vec![AnalysisInfo { score: sc, depth: 0, pv: Vec::new(), origin: AnalysisOrigin::Syzygy, multipv: 1 }]);
             }
         }
-
-        self.set_position(board).await?;
-        self.ensure_mpv(mpv).await?;
-
-        let go = Go { depth: Some(depth as usize), ..Default::default() };
-        let map: Arc<Mutex<HashMap<u32, AnalysisInfo>>> = Arc::new(Mutex::new(HashMap::new()));
-        let cb = map.clone();
-
-        let limit = Duration::from_millis(self.timeout_ms * ANALYSIS_FACTOR * depth as u64);
-        timeout(limit, self.inner.go_async(&go, move |info: Info| {
-            if let (Some(id), Some(_)) = (info.multi_pv, info.score.as_ref()) {
-                if !info.pv.is_empty() {
-                    cb.lock().unwrap().insert(id as u32, convert_info(&info, board.turn(), board));
+        // seta multipv apenas se mudou
+        if multipv != self.current_multipv {
+            self.cmd(&format!("setoption name MultiPV value {}", multipv)).await?;
+            self.current_multipv = multipv;
+        }
+        // timeout global + por linha
+        let fut = async {
+            self.ensure_synced().await?;
+            self.cmd(&format!("go depth {} multipv {}", depth, multipv)).await?;
+            let mut map = HashMap::<Vec<ShakMove>, AnalysisInfo>::new();
+            let mut line = String::new();
+            loop {
+                let n = {
+                    let mut r = self.stdout.lock().await;
+                    timeout(ENGINE_TIMEOUT, r.read_line(&mut line)).await??
+                };
+                if n == 0 || line.starts_with("bestmove") { break; }
+                if line.starts_with("info ") && line.contains(" pv ") {
+                    if let Some(info) = parse_info_line(&line, &self.board) {
+                        let entry = map.entry(info.pv.clone()).or_insert_with(|| info.clone());
+                        if info.depth > entry.depth || (info.depth == entry.depth && info.score > entry.score) {
+                            *entry = info;
+                        }
+                    }
                 }
+                line.clear();
             }
-            ready(())
-        })).await??;
-
-        let mut lines: Vec<_> = Arc::try_unwrap(map).unwrap().into_inner().unwrap().into_values().collect();
-        let sign = if board.turn() == Color::White { -1 } else { 1 };
-        lines.sort_by_key(|i| i.score.as_ref().map_or(i64::MIN, |s| sign * Self::key(s)));
-        Ok(lines)
-    }
-
-    // ---------- wrappers FEN ----------
-    pub async fn analyze_fen(&mut self, fen: &str, depth: u8, mpv: u32) -> Result<Vec<AnalysisInfo>> {
-        let pos: Chess = fen.parse::<Fen>()?.into_position(CastlingMode::Standard)?;
-        self.analyze(&pos, depth, mpv).await
-    }
-
-    pub async fn best_move(&mut self, board: &Chess, depth: u8) -> Result<Option<NormalBestMove>> {
-        let mv_opt = self.analyze(board, depth, 1).await?
-            .pop()
-            .and_then(|i| i.pv.first().cloned());
-
-        Ok(mv_opt.map(|m| NormalBestMove {
-            r#move:  UciMove::from_move(&m, CastlingMode::Standard),
-            ponder: None,
-        }))
-    }
-
-    pub async fn best_move_fen(&mut self, fen: &str, depth: u8) -> Result<Option<NormalBestMove>> {
-        let pos: Chess = fen.parse::<Fen>()?.into_position(CastlingMode::Standard)?;
-        self.best_move(&pos, depth).await
-    }
-
-    // ---------- utilitários ----------
-    pub async fn scan_position(&mut self, b: &Chess, d: DepthSet) -> Result<Vec<AnalysisInfo>> {
-        self.analyze(b, d.scan, 1).await
-    }
-    pub async fn solve_position(&mut self, b: &Chess, d: DepthSet, mpv: u32) -> Result<Vec<AnalysisInfo>> {
-        self.analyze(b, d.solve, mpv).await
-    }
-    pub async fn quit(&mut self) -> Result<()> {
-        let _ = self.send(Quit).await;
-        let _ = timeout(Duration::from_millis(1_000), self.child.wait()).await;
-        Ok(())
+            let mut res: Vec<_> = map.into_values().collect();
+            res.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.multipv.cmp(&b.multipv)));
+            Ok(res)
+        };
+        match timeout(ENGINE_TIMEOUT, fut).await {
+            Ok(inner) => inner,
+            Err(_)    => Err(anyhow!("Engine analyze global timeout")),
+        }
     }
 }
 
-impl Drop for Engine { fn drop(&mut self) { let _ = self.child.start_kill(); } }
-
-// ---------------------------------------------------------------------------
-// Helpers Syzygy
-// ---------------------------------------------------------------------------
-fn load_syzygy() -> Option<Tablebase<Chess>> {
-    let paths = env::var("SYZYGY_PATHS").ok()?;
-    let mut tb = Tablebase::new();
-    for dir in env::split_paths(&paths) { let _ = tb.add_directory(&dir); }
-    (tb.max_pieces() > 0).then_some(tb)
-}
-
-/// DTZ negativo → mate em |dtz| plies, DTZ positivo → distância até escapar do mate.
-/// Critério: se WDL=Loss, escolhe maior DTZ; caso contrário, menor DTZ.
-fn probe_tablebase(board: &Chess, tb: &Tablebase<Chess>) -> Result<AnalysisInfo> {
-    use RuciScore::*;
-    let mut best: Option<(i32, ShakMove)> = None;
-
-    for mv in board.legal_moves() {
-        let pos = board.clone().play(&mv)?;
-        let wdl = tb.probe_wdl_after_zeroing(&pos)?;
-        let dtz_raw: MaybeRounded<Dtz> = tb.probe_dtz(&pos)?;
-        let dtz = match dtz_raw { MaybeRounded::Rounded(Dtz(v)) | MaybeRounded::Precise(Dtz(v)) => v as i32 };
-
-        let want_min = wdl != Wdl::Loss;                     // perdendo? queremos maximizar
-        let better = best.as_ref().map_or(true, |(prev, _)| if want_min { dtz < *prev } else { dtz > *prev });
-        if better { best = Some((dtz, mv)); }
+/// Parser UCI “info ... pv ...”
+fn parse_info_line(line: &str, base: &Chess) -> Option<AnalysisInfo> {
+    let mut parts = line.split_whitespace().peekable();
+    let mut depth = 0;
+    let mut score = None;
+    let mut multipv = 1;
+    while let Some(tok) = parts.next() {
+        match tok {
+            "depth"   => if let Some(d) = parts.next().and_then(|s| s.parse().ok()) { depth = d },
+            "multipv" => if let Some(m) = parts.next().and_then(|s| s.parse().ok()) { multipv = m },
+            "score"   => if let Some(kind) = parts.next() {
+                if let Some(v) = parts.next().and_then(|s| s.parse().ok()) {
+                    score = match kind {
+                        "cp"   => Some(Score::Cp(v)),
+                        "mate" => Some(Score::Mate(v)),
+                        _       => None,
+                    };
+                }
+            },
+            "pv" => break,
+            _    => {},
+        }
     }
-
-    let (dtz, first_move) = best.ok_or_else(|| anyhow!("tablebase não gerou movimento"))?;
-    let raw_score = if dtz < 0 { MateIn((-dtz) as isize) } else { Centipawns(0) };
-    let score = raw_score.standardized(board.turn());
-
-    Ok(AnalysisInfo {
-        score: Some(score),
-        depth: None,
-        seldepth: None,
-        nodes: None,
-        pv: vec![first_move],
-        origin: AnalysisOrigin::Syzygy,
-    })
-}
-
-// ---------------------------------------------------------------------------
-//  Conversão Info → AnalysisInfo
-// ---------------------------------------------------------------------------
-fn convert_info(src: &Info, turn: Color, board: &Chess) -> AnalysisInfo {
-    let score    = src.score.as_ref().map(|s| s.kind.standardized(turn));
-    let depth    = src.depth.map(|d| d.depth as u8);
-    let seldepth = src.depth.and_then(|d| d.seldepth.map(|s| s as u8));
-    let nodes    = src.nodes.map(|n| n as u64);
-    let pv       = src.pv.iter().filter_map(|uci| uci.to_move(board).ok()).collect();
-    AnalysisInfo { score, depth, seldepth, nodes, pv, origin: AnalysisOrigin::Engine }
+    let sc = score?;
+    let mut tmp = base.clone();
+    let pv = parts
+        .filter_map(|u| UciMove::from_ascii(u.as_bytes()).ok())
+        .filter_map(|uci| uci.to_move(&mut tmp).ok())
+        .collect();
+    Some(AnalysisInfo { score: sc, depth, pv, origin: AnalysisOrigin::Engine, multipv })
 }
